@@ -35,9 +35,11 @@ services:
     image: clickhouse/clickhouse-server:25.5.5.19-alpine
     ports:
       - "8123:8123"
+      - 9000:9000
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - backup_volume:/backups
+      - ./backup_disk.xml:/etc/clickhouse-server/config.d/backup_disk.xml
     environment:
       CLICKHOUSE_DB: "mydb"
       CLICKHOUSE_USER: "admin"

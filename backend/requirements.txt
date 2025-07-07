@@ -3,3 +3,4 @@ uvicorn[standard]
 clickhouse-driver
 python-multipart
 aiofiles
+python-dotenv

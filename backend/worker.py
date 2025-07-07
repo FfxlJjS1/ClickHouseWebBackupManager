@@ -1,178 +1,148 @@
 import os
-import sys
-import zipfile
 import json
-from datetime import datetime
+from datetime import datetime, time
+from typing import Any, Dict, List, Optional
 from clickhouse_driver import Client
+from environments import BACKUP_META_FILE
+from logger import logger
 
-host = os.getenv('CLICKHOUSE_HOST', 'clickhouse')
-port = int(os.getenv('CLICKHOUSE_PORT', 9000))
-user = os.getenv('CLICKHOUSE_USER', 'admin')
-password = os.getenv('CLICKHOUSE_PASSWORD', 'password')
-database = os.getenv('CLICKHOUSE_DB', 'mydb')
-BACKUP_METADATA = "backup_metadata.json"
 
-def create_backup(path, backup_type):
-    client = Client(
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        database=database
-    )
-    
-    # Создаем таблицу для логов бэкапов, если не существует
-    client.execute("""
-    CREATE TABLE IF NOT EXISTS BackupLog (
-        event_time DateTime DEFAULT now(),
-        event String,
-        table_name String,
-        rows_count UInt64
-    ) ENGINE = MergeTree()
-    ORDER BY event_time
-    """)
-    
-    if backup_type == 'full':
-        # Полный бэкап: экспорт всех таблиц
-        tables = client.execute("SHOW TABLES")
-        with zipfile.ZipFile(path, 'w') as zipf:
-            metadata = {"type": "full", "timestamp": str(datetime.utcnow())}
-            
-            for table in tables:
-                table_name = table[0]
-                # Пропускаем системные таблицы
-                if table_name.startswith('system.') or table_name == 'BackupLog':
-                    continue
-                
-                # Экспорт структуры
-                create_sql = client.execute(f"SHOW CREATE TABLE {table_name}")[0][0]
-                zipf.writestr(f"{table_name}.sql", create_sql)
-                
-                # Экспорт данных
-                data = client.execute_iter(f"SELECT * FROM {table_name}")
-                with open(f'/tmp/{table_name}.csv', 'w') as f:
-                    for row in data:
-                        f.write(','.join(map(str, row)) + '\n')
-                zipf.write(f'/tmp/{table_name}.csv', f"{table_name}.csv")
-                os.remove(f'/tmp/{table_name}.csv')
-                
-                # Логируем действие
-                row_count = client.execute(f"SELECT count() FROM {table_name}")[0][0]
-                client.execute(
-                    "INSERT INTO BackupLog (event, table_name, rows_count) VALUES",
-                    [('full_backup', table_name, row_count)]
-                )
-            
-            # Сохраняем метаданные
-            zipf.writestr(BACKUP_METADATA, json.dumps(metadata))
+class BackupManager:
+    def __init__(self, meta_path: str = BACKUP_META_FILE):
+        self.meta_path = meta_path
+        self.backups = self._load_meta()
 
-    elif backup_type == 'incremental':
-        # Инкрементный бэкап: только измененные данные
-        last_backup_time = client.execute(
-            "SELECT max(event_time) FROM BackupLog WHERE event = 'full_backup'"
-        )[0][0] or datetime.min
-        
-        tables = client.execute("SHOW TABLES")
-        with zipfile.ZipFile(path, 'w') as zipf:
-            metadata = {"type": "incremental", "timestamp": str(datetime.utcnow())}
-            changes_found = False
-            
-            for table in tables:
-                table_name = table[0]
-                # Пропускаем системные таблицы
-                if table_name.startswith('system.') or table_name == 'BackupLog':
-                    continue
-                
-                # Проверяем наличие колонки с временной меткой
-                has_timestamp = client.execute(
-                    f"SELECT count() FROM system.columns "
-                    f"WHERE table = '{table_name}' AND name = 'updated_at'"
-                )[0][0] > 0
-                
-                if has_timestamp:
-                    # Экспорт только измененных данных
-                    data = client.execute_iter(
-                        f"SELECT * FROM {table_name} "
-                        f"WHERE updated_at > '{last_backup_time}'"
-                    )
-                    
-                    # Если есть изменения - сохраняем
-                    row_count = 0
-                    with open(f'/tmp/{table_name}.csv', 'w') as f:
-                        for row in data:
-                            f.write(','.join(map(str, row)) + '\n')
-                            row_count += 1
-                    
-                    if row_count > 0:
-                        changes_found = True
-                        zipf.write(f'/tmp/{table_name}.csv', f"{table_name}.csv")
-                        os.remove(f'/tmp/{table_name}.csv')
-                        
-                        # Логируем действие
-                        client.execute(
-                            "INSERT INTO BackupLog (event, table_name, rows_count) VALUES",
-                            [('incremental_backup', table_name, row_count)]
-                        )
-            
-            if not changes_found:
-                print("No changes detected for incremental backup")
+    def _load_meta(self) -> List[Dict[str, Any]]:
+        if os.path.exists(self.meta_path):
+            with open(self.meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return []
+
+    def _save_meta(self) -> None:
+        with open(self.meta_path, "w", encoding="utf-8") as f:
+            json.dump(self.backups, f, indent=2, ensure_ascii=False)
+
+    def add_backup(self, backup_info: Dict[str, Any]) -> None:
+        self.backups.append(backup_info)
+        self._save_meta()
+
+    def remove_backup(self, backup_id: str) -> bool:
+        # Проверка зависимости: нельзя удалить full, если есть incremental с base_backup=backup_id
+        backup = self.get_backup(backup_id)
+        if not backup:
+            logger.debug(f"Бэкап с id={backup_id} не найден")
+            return False
+        if backup["type"] == "full":
+            for b in self.backups:
+                if b.get("base_backup") == backup_id:
+                    logger.debug(f"Нельзя удалить полный бэкап {backup_id}, есть инкременты, ссылающиеся на него: {b['id']}")
+                    return False
+        # Удаляем бэкап
+        self.backups = [b for b in self.backups if b["id"] != backup_id]
+        self._save_meta()
+        logger.debug(f"Бэкап {backup_id} удалён из метаданных")
+        return True
+
+    def get_backup(self, backup_id: str) -> Optional[Dict[str, Any]]:
+        for b in self.backups:
+            if b["id"] == backup_id:
+                return b
+        return None
+
+    def list_backups(self, database: Optional[str] = None) -> List[Dict[str, Any]]:
+        if database:
+            return [b for b in self.backups if b["database"] == database]
+        return self.backups
+
+class ClickHouseBackup:
+    def __init__(self, host="localhost", port=9000, user="default", password="", database="default"):
+        self.client = Client(host=host, port=port, user=user, password=password, database=database)
+        self.meta = BackupManager()
+
+    def wait_for_operation(self, op_id: str, poll_sec: int = 2) -> None:
+        while True:
+            rows = self.client.execute("SELECT status, error FROM system.backups WHERE id = %(id)s", {"id": op_id})
+            if not rows:
+                logger.debug(f"⚠️  Операция {op_id} не найдена в system.backups")
                 return
-            
-            # Сохраняем метаданные
-            zipf.writestr(BACKUP_METADATA, json.dumps(metadata))
+            status, error = rows[0]
+            if status in ("BACKUP_CREATED", "RESTORED"):
+                logger.debug(f"✅ Операция {op_id} завершена со статусом {status}")
+                return
+            if status in ("BACKUP_FAILED", "RESTORE_FAILED"):
+                raise RuntimeError(f"❌ Операция {op_id} провалена: {error}")
+            logger.debug(f"⌛ Статус {status}...")
+            time.sleep(poll_sec)
 
-def restore_backup(path):
-    client = Client(
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        database=database
-    )
-    
-    with zipfile.ZipFile(path, 'r') as zipf:
-        # Читаем метаданные
-        metadata = json.loads(zipf.read(BACKUP_METADATA).decode())
-        backup_type = metadata["type"]
-        
-        # Восстановление структуры
-        for file in zipf.namelist():
-            if file.endswith('.sql'):
-                sql = zipf.read(file).decode()
-                try:
-                    client.execute(sql)
-                except Exception as e:
-                    print(f"Table creation skipped (likely exists): {str(e)}")
-        
-        # Восстановление данных
-        for file in zipf.namelist():
-            if file.endswith('.csv'):
-                table_name = file.split('.')[0]
-                
-                # Для инкрементных бэкапов не очищаем таблицу
-                if backup_type == 'full':
-                    try:
-                        client.execute(f"TRUNCATE TABLE {table_name}")
-                    except:
-                        pass
-                
-                # Загрузка данных
-                with zipf.open(file) as csv_file:
-                    client.execute(
-                        f"INSERT INTO {table_name} FORMAT CSV",
-                        csv_file.read().decode()
-                    )
-        
-        # Логируем восстановление
-        client.execute(
-            "INSERT INTO BackupLog (event) VALUES",
-            [('restore_completed',)]
-        )
+    def backup_full(self, database: str, destination: str, async_mode: bool = False) -> None:
+        query = f"BACKUP DATABASE {database} TO {destination}"
+        if async_mode:
+            query += " ASYNC"
+        logger.debug(f"Выполняется: {query}")
+        op_id, status = self.client.execute(query)[0]
+        logger.debug(f"ID операции: {op_id}, статус: {status}")
+        if not async_mode:
+            self.wait_for_operation(op_id)
+        # Записываем метаданные
+        self.meta.add_backup({
+            "id": op_id,
+            "database": database,
+            "type": "full",
+            "destination": destination,
+            "base_backup": None,
+            "timestamp": datetime.now().isoformat(),
+            "status": status
+        })
 
-if __name__ == "__main__":
-    action = sys.argv[1]
-    
-    if action == "create":
-        create_backup(sys.argv[2], sys.argv[3])
-    elif action == "restore":
-        restore_backup(sys.argv[2])
+    def backup_incremental(self, database: str, destination: str, base_backup_id: str, async_mode: bool = False) -> None:
+        base_backup = self.meta.get_backup(base_backup_id)
+        if not base_backup:
+            raise ValueError(f"Базовый бэкап {base_backup_id} не найден в метаданных")
+        base_expr = base_backup["destination"]
+        query = f"BACKUP DATABASE {database} TO {destination} SETTINGS base_backup = {base_expr}"
+        if async_mode:
+            query += " ASYNC"
+        logger.debug(f"Выполняется: {query}")
+        op_id, status = self.client.execute(query)[0]
+        logger.debug(f"ID операции: {op_id}, статус: {status}")
+        if not async_mode:
+            self.wait_for_operation(op_id)
+        self.meta.add_backup({
+            "id": op_id,
+            "database": database,
+            "type": "incremental",
+            "destination": destination,
+            "base_backup": base_backup_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "status": status
+        })
+
+    def restore(self, database: str, source: str, allow_non_empty: bool = False, async_mode: bool = False) -> None:
+        opts = " SETTINGS allow_non_empty_tables=1" if allow_non_empty else ""
+        query = f"RESTORE DATABASE {database} FROM {source}{opts}"
+        if async_mode:
+            query += " ASYNC"
+        logger.debug(f"Выполняется: {query}")
+        op_id, status = self.client.execute(query)[0]
+        logger.debug(f"ID операции: {op_id}, статус: {status}")
+        if not async_mode:
+            self.wait_for_operation(op_id)
+
+    def list_databases(self) -> List[str]:
+        rows = self.client.execute("SHOW DATABASES")
+        return [row[0] for row in rows]
+
+    def list_backups(self, database: Optional[str] = None) -> None:
+        backups = self.meta.list_backups(database)
+        if not backups:
+            logger.debug("Бэкапы не найдены")
+            return
+        for b in backups:
+            logger.debug(f"ID: {b['id']}, DB: {b['database']}, Тип: {b['type']}, Дата: {b['timestamp']}, Место: {b['destination']}")
+
+    def delete_backup(self, backup_id: str) -> None:
+        # Удаляем из метаданных
+        if not self.meta.remove_backup(backup_id):
+            return
+        # TODO: можно добавить удаление физического файла/объекта, если требуется
+        logger.debug(f"Удаление физического бэкапа по id={backup_id} не реализовано, сделайте вручную.")

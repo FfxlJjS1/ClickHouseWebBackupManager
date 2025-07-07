@@ -21,6 +21,7 @@
           <tr>
             <th>ID</th>
             <th>Тип</th>
+            <th>Описание</th>
             <th>Место хранения</th>
             <th>Дата создания</th>
             <th>Статус</th>
@@ -31,16 +32,17 @@
           <tr v-for="b in backups" :key="b.id">
             <td>{{ b.id }}</td>
             <td>{{ b.type }}</td>
+            <td>{{ b.description || 'без описания' }}</td>
             <td>{{ b.destination }}</td>
             <td>{{ formatDate(b.timestamp) }}</td>
             <td>{{ b.status }}</td>
             <td>
-              <button @click="restoreBackup(b)">Восстановить</button>
+              <button @click="startRestore(b)">Восстановить</button>
               <button @click="deleteBackup(b)" :disabled="deletingId === b.id">Удалить</button>
             </td>
           </tr>
           <tr v-if="backups.length === 0">
-            <td colspan="6">Бэкапы не найдены</td>
+            <td colspan="7">Бэкапы не найдены</td>
           </tr>
         </tbody>
       </table>
@@ -56,8 +58,8 @@
         </label>
         <br />
         <label>
-          Место хранения (пример):<br />
-          <input v-model="newBackup.destination" placeholder="Disk('backups','backup_2025-07-07.zip')" required />
+          Описание (название):<br />
+          <input v-model="newBackup.description" placeholder="Описание бэкапа" />
         </label>
         <br />
         <label v-if="newBackup.type === 'incremental'">
@@ -79,6 +81,31 @@
       {{ message }}
     </div>
   </div>
+
+  <!-- Диалог восстановления -->
+  <div v-if="showRestoreDialog" class="overlay"></div>
+  
+  <div v-if="showRestoreDialog" class="restore-dialog">
+    <h3>Восстановление базы {{ selectedBackup?.database }}</h3>
+    <p>Выберите способ восстановления:</p>
+    
+    <div class="restore-option" @click="confirmRestore('safe')">
+      <h4>Безопасный режим</h4>
+      <p>Восстановить только если таблицы пустые</p>
+      <small>(Рекомендуется для новых баз)</small>
+    </div>
+    
+    <div class="restore-option" @click="confirmRestore('overwrite')">
+      <h4>Перезаписать данные</h4>
+      <p>Разрешить восстановление в непустые таблицы</p>
+      <small>(Существующие данные будут перезаписаны!)</small>
+    </div>
+    
+    <div class="restore-option" @click="showRestoreDialog = false">
+      <h4>Отмена</h4>
+      <p>Прервать операцию восстановления</p>
+    </div>
+  </div>
 </template>
 
 <script setup>
@@ -98,9 +125,12 @@ const deletingId = ref(null);
 const message = ref("");
 const isError = ref(false);
 
+const showRestoreDialog = ref(false);
+const selectedBackup = ref(null);
+
 const newBackup = ref({
   type: "full",
-  destination: "",
+  description: "",
   base_backup_id: "",
   async_mode: false,
 });
@@ -162,10 +192,10 @@ async function createBackup() {
   try {
     const payload = {
       database: selectedDatabase.value,
-      destination: newBackup.value.destination,
       backup_type: newBackup.value.type,
       base_backup_id: newBackup.value.type === "incremental" ? newBackup.value.base_backup_id.trim() : undefined,
       async_mode: newBackup.value.async_mode,
+      description: newBackup.value.description || undefined,
     };
     const res = await fetch(`${apiBase}/backups`, {
       method: "POST",
@@ -179,6 +209,11 @@ async function createBackup() {
     const created = await res.json();
     message.value = `Бэкап создан с ID: ${created.id}`;
     isError.value = false;
+
+    // Сброс формы после успешного создания
+    newBackup.value.description = "";
+    newBackup.value.base_backup_id = "";
+
     fetchBackups();
   } catch (e) {
     message.value = `Ошибка создания бэкапа: ${e.message}`;
@@ -188,30 +223,66 @@ async function createBackup() {
   }
 }
 
-async function restoreBackup(backup) {
-  if (!confirm(`Восстановить базу ${backup.database} из бэкапа ${backup.id}?`)) return;
-  message.value = "";
-  isError.value = false;
+function startRestore(backup) {
+  showRestoreDialog.value = true;
+  selectedBackup.value = backup;
+}
+
+async function confirmRestore(mode) {
+  showRestoreDialog.value = false;
+  
+  if (!selectedBackup.value ) return;
+
+  const cleanTables = confirm("Очистить таблицы перед восстановлением? Это удалит все данные, созданные после бекапа.");
+  
+  const payload = {
+    database: selectedBackup.value.database,
+    source: selectedBackup.value.destination,
+    async_mode: false,
+    allow_non_empty: mode === 'overwrite',
+    cleanTables: cleanTables
+  };
+
   try {
-    const payload = {
-      database: backup.database,
-      source: backup.destination,
-      allow_non_empty: false,
-      async_mode: false,
-    };
     const res = await fetch(`${apiBase}/backups/restore`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || `Ошибка ${res.status}`);
+      const errorData = await res.json();
+      
+      // Специальная обработка ошибки о непустых таблицах
+      if (errorData.detail && errorData.detail.includes("не пуста")) {
+        const confirmOverwrite = confirm(
+          `${errorData.detail}\n\nПринудительно перезаписать данные?`
+        );
+        
+        if (confirmOverwrite) {
+          // Повторяем запрос с разрешением перезаписи
+          payload.allow_non_empty = true;
+          const retryRes = await fetch(`${apiBase}/backups/restore`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          
+          if (!retryRes.ok) throw new Error(await retryRes.text());
+          message.value = `Восстановление из бэкапа ${selectedBackup.value.id} запущено (принудительный режим)`;
+          return;
+        }
+      }
+      throw new Error(errorData.detail || `Ошибка ${res.status}`);
     }
-    message.value = `Восстановление из бэкапа ${backup.id} запущено`;
+    
+    message.value = `Восстановление из бэкапа ${selectedBackup.value.id} запущено`;
+    isError.value = false;
   } catch (e) {
     message.value = `Ошибка восстановления: ${e.message}`;
     isError.value = true;
+  } finally {
+    selectedBackup.value = null;
   }
 }
 
@@ -244,7 +315,7 @@ fetchDatabases();
 
 <style scoped>
 .app {
-  max-width: 900px;
+  max-width: 1100px;
   margin: auto;
   font-family: Arial, sans-serif;
   padding: 1rem;
@@ -265,5 +336,41 @@ button {
 .message.error {
   background-color: #fdd;
   color: #900;
+}
+
+/* Cтили для диалога */
+.restore-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: white;
+  padding: 20px;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+  z-index: 1000;
+}
+
+.overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 999;
+}
+
+.restore-option {
+  margin: 10px 0;
+  padding: 10px;
+  border: 1px solid #eee;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.restore-option:hover {
+  background-color: #f5f5f5;
 }
 </style>

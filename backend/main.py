@@ -1,7 +1,9 @@
+import shutil
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import os
+from datetime import datetime
 
 from pydantic import BaseModel
 
@@ -32,16 +34,17 @@ BACKUP_DIR = os.getenv("BACKUP_STORAGE", "/backups")
 
 class BackupCreateRequest(BaseModel):
     database: str
-    destination: str
     backup_type: str = "full"  # full или incremental
     base_backup_id: Optional[str] = None  # для incremental
     async_mode: bool = False
+    description: Optional[str] = None
 
 class BackupRestoreRequest(BaseModel):
     database: str
     source: str
     allow_non_empty: bool = False
     async_mode: bool = False
+    clean_tables: bool = False
 
 class BackupInfo(BaseModel):
     id: str
@@ -51,6 +54,7 @@ class BackupInfo(BaseModel):
     base_backup: Optional[str]
     timestamp: str
     status: str
+    description: Optional[str] = None
 
 # --- Эндпоинты --- #
 
@@ -76,13 +80,29 @@ async def create_backup(req: BackupCreateRequest):
     """
     if req.backup_type not in ("full", "incremental"):
         raise HTTPException(status_code=400, detail="backup_type должен быть 'full' или 'incremental'")
+    
+    # Автоматически генерируем путь для бэкапа
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(BACKUP_DIR, req.database, req.backup_type, f"backup_{timestamp}")
+    destination = f"File('{backup_path}')"
 
     if req.backup_type == "full":
-        chb.backup_full(req.database, req.destination, async_mode=req.async_mode)
+        chb.backup_full(
+            database=req.database,
+            destination=destination,
+            async_mode=req.async_mode,
+            description=req.description
+        )
     else:
         if not req.base_backup_id:
             raise HTTPException(status_code=400, detail="base_backup_id обязателен для incremental бэкапа")
-        chb.backup_incremental(req.database, req.destination, req.base_backup_id, async_mode=req.async_mode)
+        chb.backup_incremental(
+            database=req.database,
+            destination=destination,
+            base_backup_id=req.base_backup_id,
+            async_mode=req.async_mode,
+            description=req.description
+        )
 
     # Возвращаем последний добавленный бэкап (предполагается, что add_backup вызывается внутри методов)
     backups = chb.meta.list_backups(req.database)
@@ -93,16 +113,58 @@ async def restore_backup(req: BackupRestoreRequest):
     """
     Восстановить базу из бэкапа.
     """
-    chb.restore(req.database, req.source, allow_non_empty=req.allow_non_empty, async_mode=req.async_mode)
-    return {"status": "restoration_started"}
+    if not req.allow_non_empty:
+        # Проверяем, что таблицы пустые
+        for table in chb.get_tables(req.database):
+            if chb.table_has_data(req.database, table):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Таблица {table} не пуста. Используйте allow_non_empty=true для перезаписи"
+                )
+    
+    try:
+        chb.restore(
+            database=req.database,
+            source=req.source,
+            allow_non_empty=req.allow_non_empty,
+            async_mode=req.async_mode,
+            clean_tables=req.clean_tables
+        )
+        return {"status": "restoration_started"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка восстановления: {str(e)}"
+        )
 
 @app.delete("/api/backups/{backup_id}")
 async def delete_backup(backup_id: str):
     """
     Удалить бэкап по ID с проверкой зависимостей.
     """
-    success = chb.meta.remove_backup(backup_id)
-    if not success:
-        raise HTTPException(status_code=400, detail="Нельзя удалить бэкап: есть зависимости или не найден")
-    # TODO: здесь можно добавить удаление физического файла/объекта, если требуется
-    return {"status": "deleted"}
+    # Удаляем из метаданных и получаем информацию о бекапе
+    backup_info = chb.meta.remove_backup(backup_id)
+    
+    if backup_info is None:
+        raise HTTPException(
+            status_code=400, 
+            detail="Нельзя удалить бэкап: есть зависимости или не найден"
+        )
+    
+    # Извлекаем путь из destination (формат: "File('/path/to/backup')")
+    destination = backup_info["destination"]
+    if destination.startswith("File('") and destination.endswith("')"):
+        backup_path = destination[6:-2]  # Убираем "File('" и "')"
+        
+        try:
+            # Проверяем существование пути
+            if os.path.exists(backup_path):
+                # Рекурсивно удаляем директорию
+                shutil.rmtree(backup_path)
+                return {"status": "deleted", "path": backup_path}
+            else:
+                return {"status": "deleted_meta", "detail": f"Физический бэкап не найден: {backup_path}"}
+        except Exception as e:
+            return {"status": "deleted_meta", "detail": f"Ошибка удаления физического бэкапа: {str(e)}"}
+    
+    return {"status": "deleted_meta", "detail": "Физическое удаление не поддерживается для этого типа бекапа"}

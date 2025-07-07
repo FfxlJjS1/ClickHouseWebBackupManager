@@ -2,7 +2,7 @@ import os
 import json
 from datetime import datetime, time
 from typing import Any, Dict, List, Optional
-from clickhouse_driver import Client
+from clickhouse_driver import Client, errors as clickhouse_errors
 from environments import BACKUP_META_FILE
 from logger import logger
 
@@ -26,22 +26,24 @@ class BackupManager:
         self.backups.append(backup_info)
         self._save_meta()
 
-    def remove_backup(self, backup_id: str) -> bool:
+    def remove_backup(self, backup_id: str) -> Optional[Dict[str, Any]]:
         # Проверка зависимости: нельзя удалить full, если есть incremental с base_backup=backup_id
         backup = self.get_backup(backup_id)
         if not backup:
             logger.debug(f"Бэкап с id={backup_id} не найден")
-            return False
-        if backup["type"] == "full":
-            for b in self.backups:
-                if b.get("base_backup") == backup_id:
-                    logger.debug(f"Нельзя удалить полный бэкап {backup_id}, есть инкременты, ссылающиеся на него: {b['id']}")
-                    return False
+            return None
+        
+        # Проверка: есть ли бэкапы, которые ссылаются на удаляемый
+        for b in self.backups:
+            if b.get("base_backup") == backup_id:
+                logger.debug(f"Нельзя удалить бэкап {backup_id}, есть зависимые бэкапы: {b['id']}")
+                return None
+                
         # Удаляем бэкап
         self.backups = [b for b in self.backups if b["id"] != backup_id]
         self._save_meta()
         logger.debug(f"Бэкап {backup_id} удалён из метаданных")
-        return True
+        return backup # Возвращаем информацию об удаленном бекапе
 
     def get_backup(self, backup_id: str) -> Optional[Dict[str, Any]]:
         for b in self.backups:
@@ -74,7 +76,7 @@ class ClickHouseBackup:
             logger.debug(f"⌛ Статус {status}...")
             time.sleep(poll_sec)
 
-    def backup_full(self, database: str, destination: str, async_mode: bool = False) -> None:
+    def backup_full(self, database: str, destination: str, async_mode: bool = False, description: Optional[str] = None) -> None:
         query = f"BACKUP DATABASE {database} TO {destination}"
         if async_mode:
             query += " ASYNC"
@@ -91,10 +93,11 @@ class ClickHouseBackup:
             "destination": destination,
             "base_backup": None,
             "timestamp": datetime.now().isoformat(),
-            "status": status
+            "status": status,
+            "description": description
         })
 
-    def backup_incremental(self, database: str, destination: str, base_backup_id: str, async_mode: bool = False) -> None:
+    def backup_incremental(self, database: str, destination: str, base_backup_id: str, async_mode: bool = False, description: Optional[str] = None) -> None:
         base_backup = self.meta.get_backup(base_backup_id)
         if not base_backup:
             raise ValueError(f"Базовый бэкап {base_backup_id} не найден в метаданных")
@@ -113,36 +116,62 @@ class ClickHouseBackup:
             "type": "incremental",
             "destination": destination,
             "base_backup": base_backup_id,
-            "timestamp": datetime.utcnow().isoformat(),
-            "status": status
+            "timestamp": datetime.now().isoformat(),
+            "status": status,
+            "description": description
         })
 
-    def restore(self, database: str, source: str, allow_non_empty: bool = False, async_mode: bool = False) -> None:
-        opts = " SETTINGS allow_non_empty_tables=1" if allow_non_empty else ""
-        query = f"RESTORE DATABASE {database} FROM {source}{opts}"
+    def restore(self, database: str, source: str, allow_non_empty: bool = False,
+                async_mode: bool = False, clean_tables: bool = False) -> None:
+        opts = []
+        if allow_non_empty:
+            opts.append("allow_non_empty_tables=1")
+        if clean_tables:
+            opts.append("clean_tables=1")
+        
+        query = f"RESTORE DATABASE {database} FROM {source}"
+        if opts:
+            query += " SETTINGS " + ", ".join(opts)
+            
         if async_mode:
             query += " ASYNC"
+        
         logger.debug(f"Выполняется: {query}")
         op_id, status = self.client.execute(query)[0]
         logger.debug(f"ID операции: {op_id}, статус: {status}")
+        
         if not async_mode:
             self.wait_for_operation(op_id)
 
     def list_databases(self) -> List[str]:
         rows = self.client.execute("SHOW DATABASES")
         return [row[0] for row in rows]
+    
+    def get_tables(self, database: str) -> List[str]:
+        """Получить список таблиц в указанной базе данных"""
+        try:
+            tables = self.client.execute(
+                "SHOW TABLES FROM %(database)s",
+                {"database": database}
+            )
+            return [table[0] for table in tables]
+        except clickhouse_errors.ServerException as e:
+            # Если база не существует, вернем пустой список
+            if "Database" in e.message and "doesn't exist" in e.message:
+                return []
+            raise
 
-    def list_backups(self, database: Optional[str] = None) -> None:
-        backups = self.meta.list_backups(database)
-        if not backups:
-            logger.debug("Бэкапы не найдены")
-            return
-        for b in backups:
-            logger.debug(f"ID: {b['id']}, DB: {b['database']}, Тип: {b['type']}, Дата: {b['timestamp']}, Место: {b['destination']}")
-
-    def delete_backup(self, backup_id: str) -> None:
-        # Удаляем из метаданных
-        if not self.meta.remove_backup(backup_id):
-            return
-        # TODO: можно добавить удаление физического файла/объекта, если требуется
-        logger.debug(f"Удаление физического бэкапа по id={backup_id} не реализовано, сделайте вручную.")
+    def table_has_data(self, database: str, table: str) -> bool:
+        """Проверить, содержит ли таблица данные"""
+        try:
+            # Используем быструю проверку через system.parts
+            result = self.client.execute(
+                "SELECT total_rows FROM system.parts "
+                "WHERE database = %(database)s AND table = %(table)s AND active "
+                "LIMIT 1",
+                {"database": database, "table": table}
+            )
+            return bool(result and result[0][0] > 0)
+        except clickhouse_errors.ServerException:
+            # Если таблица не существует, вернем False
+            return False

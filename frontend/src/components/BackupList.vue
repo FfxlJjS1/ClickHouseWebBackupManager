@@ -91,12 +91,15 @@ export default {
       return backupName
     },
     async restoreBackup(backupName) {
+      // Извлекаем UUID из имени файла (удаляем .zip)
+      const backupId = backupName.replace('.zip', '');
+
       if (!confirm(`Are you sure you want to restore ${backupName}? This will overwrite current data.`)) 
         return
       
       this.isRestoring = true
       try {
-        const result = await this.$store.dispatch('restoreBackup', backupName)
+        const result = await this.$store.dispatch('restoreBackup', backupId)
         if (result.success) {
           alert('Restore completed successfully!')
         } else {
@@ -107,12 +110,14 @@ export default {
       }
     },
     async deleteBackup(backupName) {
-      if (!confirm(`Permanently delete ${backupName}?`)) return
+      const backupId = backupName.replace('.zip', '');
+
+      if (!confirm(`Permanently delete ${backupId}?`)) return
       
       this.isDeleting = true
       try {
-        // TODO: Implement delete functionality in backend
-        alert('Delete functionality will be implemented in next version')
+      await this.$store.dispatch('deleteBackup', backupId);
+        alert('Backup deleted successfully!');
       } finally {
         this.isDeleting = false
       }

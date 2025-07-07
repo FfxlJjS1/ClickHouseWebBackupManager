@@ -5,77 +5,46 @@ networks:
     driver: bridge
 
 services:
-  clickhouse:
-    image: clickhouse/clickhouse-server:25.5.5.19-alpine
-    volumes:
-      - ch_data:/var/lib/clickhouse
-      - ch_backups:/backups
-      - ./clickhouse-config.xml:/etc/clickhouse-server/config.d/network.xml
-    networks:
-      - backup-network
-    environment:
-      CLICKHOUSE_DB: default
-      CLICKHOUSE_USER: admin
-      CLICKHOUSE_PASSWORD: secret
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  backup_manager:
-    image: altinity/clickhouse-backup:2.6.23
-    volumes:
-      - ch_data:/var/lib/clickhouse
-      - ch_backups:/backups
-      - ./scripts:/scripts
-    environment:
-      CLICKHOUSE_USER: admin
-      CLICKHOUSE_PASSWORD: secret
-    ports:
-      - 7171:7171
-    command: sleep infinity
-    networks:
-      - backup-network
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
-    environment:
-      - CLICKHOUSE_HOST=clickhouse
-      - CLICKHOUSE_PORT=9000
-      - CLICKHOUSE_USER=admin
-      - CLICKHOUSE_PASSWORD=secret
-    volumes:
-      - ./scripts:/app/scripts
-      - ./backend/.env:/app/.env
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-    networks:
-      - backup-network
-
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    build: ./frontend
     ports:
-      - "80:80"
-    environment:
-      - API_URL=http://backend:8000
-      - VUE_APP_API_URL=/api
-    networks:
-      - backup-network
+      - 80:80
     depends_on:
       - backend
+    networks:
+      - backup-network
+
+  backend:
+    build: ./backend
+    environment:
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      BACKUP_STORAGE: "/backups"
+      CLICKHOUSE_HOST: "clickhouse"
+      CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_USER: "admin"
+      CLICKHOUSE_PASSWORD: "password"
+      CLICKHOUSE_DB: "mydb"
+    volumes:
+      - backup_volume:/backups
+    depends_on:
+      - clickhouse
+    networks:
+      - backup-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.5.5.19-alpine
+    ports:
+      - "8123:8123"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - backup_volume:/backups
+    environment:
+      CLICKHOUSE_DB: "mydb"
+      CLICKHOUSE_USER: "admin"
+      CLICKHOUSE_PASSWORD: "password"
+    networks:
+      - backup-network
 
 volumes:
-  ch_data:
-  ch_backups:
+  clickhouse_data:
+  backup_volume:

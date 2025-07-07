@@ -11,7 +11,7 @@ const api = axios.create({
 export default {
   async getBackups() {
     try {
-      const response = await api.get('/backups/list')
+      const response = await api.get('/backups')
       return response.data.backups || []
     } catch (error) {
       console.error('Error fetching backups:', error)

@@ -5,11 +5,7 @@ export default createStore({
   state: {
     backups: [],
     loading: false,
-    error: null,
-    settings: {
-      retentionDays: 30,
-      autoBackup: true
-    }
+    error: null
   },
   mutations: {
     SET_BACKUPS(state, backups) {
@@ -20,52 +16,74 @@ export default createStore({
     },
     SET_ERROR(state, error) {
       state.error = error
-    },
-    UPDATE_SETTINGS(state, settings) {
-      state.settings = { ...state.settings, ...settings }
     }
   },
   actions: {
     async fetchBackups({ commit }) {
       commit('SET_LOADING', true)
+      commit('SET_ERROR', null)
+      
       try {
-        const response = await axios.get('/backups/list')
-        commit('SET_BACKUPS', response.data.backups)
-        commit('SET_ERROR', null)
+        const response = await axios.get('/api/backups')
+        const backups = response.data.map(name => ({
+          name,
+          type: name.includes('inc') ? 'incremental' : 'full',
+          size: 'N/A' // В реальном приложении можно добавить размер
+        }))
+        commit('SET_BACKUPS', backups)
       } catch (error) {
-        commit('SET_ERROR', 'Failed to fetch backups')
-        console.error(error)
+        commit('SET_ERROR', 'Failed to load backups: ' + error.message)
       } finally {
         commit('SET_LOADING', false)
       }
     },
-    async createBackup({ dispatch }, type) {
+    
+    async createBackup({ commit, dispatch }, backupType) {
+      commit('SET_LOADING', true)
+      commit('SET_ERROR', null)
+      
       try {
-        const response = await axios.post('/backups/create', { backup_type: type })
-        dispatch('fetchBackups')
-        return { 
-          success: true,
-          output: response.data.output || 'Backup created successfully'
-        }
+        await axios.post('/api/backups/create', null, {
+          params: { backup_type: backupType }
+        })
+        // Даем время на создание бэкапа перед обновлением списка
+        setTimeout(() => dispatch('fetchBackups'), 2000)
       } catch (error) {
-        return { 
-          success: false, 
-          message: error.response?.data?.output || 'Unknown error' 
-        }
+        commit('SET_ERROR', 'Backup creation failed: ' + error.message)
+        throw error
+      } finally {
+        commit('SET_LOADING', false)
       }
     },
-    async restoreBackup({ commit }, backupName) {
+    
+    async restoreBackup({ commit }, backupId) {
+      commit('SET_LOADING', true)
+      commit('SET_ERROR', null)
+      
       try {
-        const response = await axios.post(`/backups/restore/${backupName}`)
-        return { 
-          success: true,
-          output: response.data.output || 'Restore completed successfully'
-        }
+        await axios.post(`/api/backups/restore/${encodeURIComponent(backupId)}`)
+        return { success: true, message: 'Restore initiated successfully' }
       } catch (error) {
-        return { 
-          success: false, 
-          message: error.response?.data?.output || 'Restore failed' 
-        }
+        commit('SET_ERROR', 'Restore failed: ' + error.message)
+        return { success: false, message: error.message }
+      } finally {
+        commit('SET_LOADING', false)
+      }
+    },
+    
+    async deleteBackup({ commit, dispatch }, backupId) {
+      commit('SET_LOADING', true)
+      commit('SET_ERROR', null)
+      
+      try {
+        await axios.delete(`/api/backups/${encodeURIComponent(backupId)}`)
+        dispatch('fetchBackups')
+        return { success: true }
+      } catch (error) {
+        commit('SET_ERROR', 'Delete failed: ' + error.message)
+        return { success: false }
+      } finally {
+        commit('SET_LOADING', false)
       }
     }
   }

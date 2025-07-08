@@ -5,10 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, constr
 
+from validation import validate_backup_identifier, validate_identifier
 from worker import ClickHouseBackup
-from environments import CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB
+from environments import BACKUP_DIR, CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB
 
 
 app = FastAPI(title="ClickHouse Backup Manager API")
@@ -28,8 +29,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BACKUP_DIR = os.getenv("BACKUP_STORAGE", "/backups")
-
 # --- Pydantic модели для запросов и ответов --- #
 
 class BackupCreateRequest(BaseModel):
@@ -41,10 +40,8 @@ class BackupCreateRequest(BaseModel):
 
 class BackupRestoreRequest(BaseModel):
     database: str
-    source: str
-    allow_non_empty: bool = False
+    backup_id: str
     async_mode: bool = False
-    clean_tables: bool = False
 
 class BackupInfo(BaseModel):
     id: str
@@ -70,6 +67,8 @@ async def list_backups(database: Optional[str] = Query(None, description="Фил
     """
     Получить список бэкапов, опционально отфильтрованных по базе.
     """
+    validate_identifier(database)
+    
     backups = chb.meta.list_backups(database)
     return backups
 
@@ -78,6 +77,9 @@ async def create_backup(req: BackupCreateRequest):
     """
     Создать бэкап (full или incremental).
     """
+    validate_identifier(req.database)
+    validate_identifier(req.backup_type)
+
     if req.backup_type not in ("full", "incremental"):
         raise HTTPException(status_code=400, detail="backup_type должен быть 'full' или 'incremental'")
     
@@ -96,6 +98,7 @@ async def create_backup(req: BackupCreateRequest):
     else:
         if not req.base_backup_id:
             raise HTTPException(status_code=400, detail="base_backup_id обязателен для incremental бэкапа")
+
         chb.backup_incremental(
             database=req.database,
             destination=destination,
@@ -111,24 +114,27 @@ async def create_backup(req: BackupCreateRequest):
 @app.post("/api/backups/restore")
 async def restore_backup(req: BackupRestoreRequest):
     """
-    Восстановить базу из бэкапа.
+    Восстановить базу из бэкапа по его ID.
     """
-    if not req.allow_non_empty:
-        # Проверяем, что таблицы пустые
-        for table in chb.get_tables(req.database):
-            if chb.table_has_data(req.database, table):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Таблица {table} не пуста. Используйте allow_non_empty=true для перезаписи"
-                )
+    validate_identifier(req.database)
+    validate_backup_identifier(req.backup_id)
+
+    # Получаем информацию о бэкапе по ID
+    backup_info = chb.meta.get_backup(req.backup_id)
+    if not backup_info:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Бэкап с ID {req.backup_id} не найден"
+        )
     
+    # Извлекаем путь из destination
+    source = backup_info["destination"]
+
     try:
         chb.restore(
             database=req.database,
-            source=req.source,
-            allow_non_empty=req.allow_non_empty,
-            async_mode=req.async_mode,
-            clean_tables=req.clean_tables
+            source=source,
+            async_mode=req.async_mode
         )
         return {"status": "restoration_started"}
     except Exception as e:
@@ -142,6 +148,8 @@ async def delete_backup(backup_id: str):
     """
     Удалить бэкап по ID с проверкой зависимостей.
     """
+    validate_backup_identifier(backup_id)
+
     # Удаляем из метаданных и получаем информацию о бекапе
     backup_info = chb.meta.remove_backup(backup_id)
     

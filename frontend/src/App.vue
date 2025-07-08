@@ -81,31 +81,6 @@
       {{ message }}
     </div>
   </div>
-
-  <!-- Диалог восстановления -->
-  <div v-if="showRestoreDialog" class="overlay"></div>
-  
-  <div v-if="showRestoreDialog" class="restore-dialog">
-    <h3>Восстановление базы {{ selectedBackup?.database }}</h3>
-    <p>Выберите способ восстановления:</p>
-    
-    <div class="restore-option" @click="confirmRestore('safe')">
-      <h4>Безопасный режим</h4>
-      <p>Восстановить только если таблицы пустые</p>
-      <small>(Рекомендуется для новых баз)</small>
-    </div>
-    
-    <div class="restore-option" @click="confirmRestore('overwrite')">
-      <h4>Перезаписать данные</h4>
-      <p>Разрешить восстановление в непустые таблицы</p>
-      <small>(Существующие данные будут перезаписаны!)</small>
-    </div>
-    
-    <div class="restore-option" @click="showRestoreDialog = false">
-      <h4>Отмена</h4>
-      <p>Прервать операцию восстановления</p>
-    </div>
-  </div>
 </template>
 
 <script setup>
@@ -223,66 +198,31 @@ async function createBackup() {
   }
 }
 
-function startRestore(backup) {
-  showRestoreDialog.value = true;
-  selectedBackup.value = backup;
-}
-
-async function confirmRestore(mode) {
-  showRestoreDialog.value = false;
+async function startRestore(backup) {
+  if (!confirm(`Восстановить базу ${backup.database} из бэкапа ${backup.id}?\nВсе текущие данные будут удалены!`)) {
+    return;
+  }
   
-  if (!selectedBackup.value ) return;
-
-  const cleanTables = confirm("Очистить таблицы перед восстановлением? Это удалит все данные, созданные после бекапа.");
-  
-  const payload = {
-    database: selectedBackup.value.database,
-    source: selectedBackup.value.destination,
-    async_mode: false,
-    allow_non_empty: mode === 'overwrite',
-    cleanTables: cleanTables
-  };
-
   try {
+    const payload = {
+      database: backup.database,
+      backup_id: backup.id,
+      async_mode: false
+    };
+    
     const res = await fetch(`${apiBase}/backups/restore`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     
-    if (!res.ok) {
-      const errorData = await res.json();
-      
-      // Специальная обработка ошибки о непустых таблицах
-      if (errorData.detail && errorData.detail.includes("не пуста")) {
-        const confirmOverwrite = confirm(
-          `${errorData.detail}\n\nПринудительно перезаписать данные?`
-        );
-        
-        if (confirmOverwrite) {
-          // Повторяем запрос с разрешением перезаписи
-          payload.allow_non_empty = true;
-          const retryRes = await fetch(`${apiBase}/backups/restore`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-          
-          if (!retryRes.ok) throw new Error(await retryRes.text());
-          message.value = `Восстановление из бэкапа ${selectedBackup.value.id} запущено (принудительный режим)`;
-          return;
-        }
-      }
-      throw new Error(errorData.detail || `Ошибка ${res.status}`);
-    }
+    if (!res.ok) throw new Error(await res.text());
     
-    message.value = `Восстановление из бэкапа ${selectedBackup.value.id} запущено`;
+    message.value = `Восстановление из бэкапа ${backup.id} запущено`;
     isError.value = false;
   } catch (e) {
     message.value = `Ошибка восстановления: ${e.message}`;
     isError.value = true;
-  } finally {
-    selectedBackup.value = null;
   }
 }
 
@@ -336,41 +276,5 @@ button {
 .message.error {
   background-color: #fdd;
   color: #900;
-}
-
-/* Cтили для диалога */
-.restore-dialog {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  background: white;
-  padding: 20px;
-  border: 1px solid #ccc;
-  border-radius: 5px;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-  z-index: 1000;
-}
-
-.overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0,0,0,0.5);
-  z-index: 999;
-}
-
-.restore-option {
-  margin: 10px 0;
-  padding: 10px;
-  border: 1px solid #eee;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.restore-option:hover {
-  background-color: #f5f5f5;
 }
 </style>

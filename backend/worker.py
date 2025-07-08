@@ -65,15 +65,15 @@ class ClickHouseBackup:
         while True:
             rows = self.client.execute("SELECT status, error FROM system.backups WHERE id = %(id)s", {"id": op_id})
             if not rows:
-                logger.debug(f"⚠️  Операция {op_id} не найдена в system.backups")
+                logger.debug(f"Операция {op_id} не найдена в system.backups")
                 return
             status, error = rows[0]
             if status in ("BACKUP_CREATED", "RESTORED"):
-                logger.debug(f"✅ Операция {op_id} завершена со статусом {status}")
+                logger.debug(f"Операция {op_id} завершена со статусом {status}")
                 return
             if status in ("BACKUP_FAILED", "RESTORE_FAILED"):
                 raise RuntimeError(f"❌ Операция {op_id} провалена: {error}")
-            logger.debug(f"⌛ Статус {status}...")
+            logger.debug(f"Статус {status}...")
             time.sleep(poll_sec)
 
     def backup_full(self, database: str, destination: str, async_mode: bool = False, description: Optional[str] = None) -> None:
@@ -85,6 +85,7 @@ class ClickHouseBackup:
         logger.debug(f"ID операции: {op_id}, статус: {status}")
         if not async_mode:
             self.wait_for_operation(op_id)
+
         # Записываем метаданные
         self.meta.add_backup({
             "id": op_id,
@@ -110,6 +111,7 @@ class ClickHouseBackup:
         logger.debug(f"ID операции: {op_id}, статус: {status}")
         if not async_mode:
             self.wait_for_operation(op_id)
+
         self.meta.add_backup({
             "id": op_id,
             "database": database,
@@ -121,28 +123,36 @@ class ClickHouseBackup:
             "description": description
         })
 
-    def restore(self, database: str, source: str, allow_non_empty: bool = False,
-                async_mode: bool = False, clean_tables: bool = False) -> None:
-        opts = []
-        if allow_non_empty:
-            opts.append("allow_non_empty_tables=1")
-        if clean_tables:
-            opts.append("clean_tables=1")
+    def restore(self, database: str, source: str,
+                async_mode: bool = False) -> None:
+        # Удаление всех таблиц в базе (если база существует)
+        try:
+            tables = self.get_tables(database)
+            for table in tables:
+                logger.debug(f"Удаление таблицы: {database}.{table}")
+                # Для асинхронного режима используем SYNC для гарантии удаления
+                self.client.execute(f"DROP TABLE IF EXISTS {database}.{table} SYNC")
+        except clickhouse_errors.ServerException as e:
+            if "Database doesn't exist" not in str(e):
+                logger.error(f"Ошибка при очистке базы: {str(e)}")
+                raise
         
+        # Выполнение восстановления
         query = f"RESTORE DATABASE {database} FROM {source}"
-        if opts:
-            query += " SETTINGS " + ", ".join(opts)
-            
         if async_mode:
             query += " ASYNC"
-        
-        logger.debug(f"Выполняется: {query}")
-        op_id, status = self.client.execute(query)[0]
-        logger.debug(f"ID операции: {op_id}, статус: {status}")
-        
-        if not async_mode:
-            self.wait_for_operation(op_id)
 
+        logger.debug(f"Выполняется: {query}")
+        try:
+            op_id, status = self.client.execute(query)[0]
+            logger.debug(f"ID операции: {op_id}, статус: {status}")
+            
+            if not async_mode:
+                self.wait_for_operation(op_id)
+        except Exception as e:
+            logger.error(f"Ошибка при восстановлении: {str(e)}")
+            raise
+        
     def list_databases(self) -> List[str]:
         rows = self.client.execute("SHOW DATABASES")
         return [row[0] for row in rows]
@@ -151,7 +161,7 @@ class ClickHouseBackup:
         """Получить список таблиц в указанной базе данных"""
         try:
             tables = self.client.execute(
-                "SHOW TABLES FROM %(database)s",
+                "SELECT name FROM system.tables WHERE database = %(database)s",
                 {"database": database}
             )
             return [table[0] for table in tables]

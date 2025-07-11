@@ -8,4 +8,4 @@ CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', 'password')
 CLICKHOUSE_DB = os.getenv('CLICKHOUSE_DB', 'mydb')
 BACKUP_DIR = os.getenv("BACKUP_STORAGE", "/backups")
 
-BACKUP_META_FILE = os.path.join(BACKUP_DIR, "backups.json")
+BACKUP_META_DB = os.path.join(BACKUP_DIR, "backups.db")

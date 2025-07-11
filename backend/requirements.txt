@@ -4,3 +4,6 @@ clickhouse-driver
 python-multipart
 aiofiles
 python-dotenv
+pytest
+pytest-asyncio
+httpx

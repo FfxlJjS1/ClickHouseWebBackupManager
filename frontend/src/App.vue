@@ -15,34 +15,96 @@
     <section v-if="selectedDatabase">
       <h2>Бэкапы базы: {{ selectedDatabase }}</h2>
       <button @click="fetchBackups" :disabled="loadingBackups">Обновить список</button>
+      <button @click="resetFilters" class="reset-btn">Сбросить фильтры</button>
 
       <table border="1" cellpadding="5" cellspacing="0">
         <thead>
           <tr>
-            <th>ID</th>
-            <th>Тип</th>
-            <th>Описание</th>
-            <th>Место хранения</th>
-            <th>Дата создания</th>
-            <th>Статус</th>
+            <th @click="toggleSort('id')" class="sortable">
+              ID 
+              <span v-if="sortField === 'id'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+            </th>
+            <th @click="toggleSort('type')" class="sortable">
+              Тип 
+              <span v-if="sortField === 'type'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+            </th>
+            <th @click="toggleSort('description')" class="sortable">
+              Описание 
+              <span v-if="sortField === 'description'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+            </th>
+            <th @click="toggleSort('base_backup')" class="sortable">
+              ID базового бекапа 
+              <span v-if="sortField === 'base_backup'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+            </th>
+            <th @click="toggleSort('timestamp')" class="sortable">
+              Дата создания 
+              <span v-if="sortField === 'timestamp'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+            </th>
+            <th @click="toggleSort('size')" class="sortable">
+              Размер 
+              <span v-if="sortField === 'size'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+            </th>
+            <th @click="toggleSort('status')" class="sortable">
+              Статус 
+              <span v-if="sortField === 'status'">{{ sortDirection === 'asc' ? '▲' : '▼' }}</span>
+            </th>
             <th>Действия</th>
+          </tr>
+          <tr class="filter-row">
+            <td>
+              <input type="text" v-model="filters.id" placeholder="Фильтр ID" />
+            </td>
+            <td>
+              <select v-model="filters.type">
+                <option value="">Все</option>
+                <option value="full">Полный</option>
+                <option value="incremental">Инкрементный</option>
+              </select>
+            </td>
+            <td>
+              <input type="text" v-model="filters.description" placeholder="Фильтр описания" />
+            </td>
+            <td>
+              <input type="text" v-model="filters.base_backup" placeholder="Фильтр базового ID" />
+            </td>
+            <td>
+              <input type="text" v-model="filters.timestamp" placeholder="Фильтр даты" />
+            </td>
+            <td>
+              <select v-model="filters.size">
+                <option value="">Все</option>
+                <option value="small">Малые (< 1MB)</option>
+                <option value="medium">Средние (1MB-100MB)</option>
+                <option value="large">Большие (> 100MB)</option>
+              </select>
+            </td>
+            <td>
+              <select v-model="filters.status">
+                <option value="">Все</option>
+                <option value="BACKUP_CREATED">Успешно</option>
+                <option value="BACKUP_FAILED">Ошибка</option>
+                <option value="CREATING">В процессе</option>
+              </select>
+            </td>
+            <td></td>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="b in backups" :key="b.id">
+          <tr v-for="b in processedBackups" :key="b.id">
             <td>{{ b.id }}</td>
             <td>{{ b.type }}</td>
-            <td>{{ b.description || 'без описания' }}</td>
-            <td>{{ b.destination }}</td>
+            <td>{{ b.description || 'Без описания' }}</td>
+            <td>{{ b.base_backup || 'Отсутствует' }}</td>
             <td>{{ formatDate(b.timestamp) }}</td>
+            <td>{{ formatSize(b.size) }}</td>
             <td>{{ b.status }}</td>
             <td>
               <button @click="startRestore(b)">Восстановить</button>
               <button @click="deleteBackup(b)" :disabled="deletingId === b.id">Удалить</button>
             </td>
           </tr>
-          <tr v-if="backups.length === 0">
-            <td colspan="7">Бэкапы не найдены</td>
+          <tr v-if="processedBackups.length === 0">
+            <td colspan="8">Бэкапы не найдены</td>
           </tr>
         </tbody>
       </table>
@@ -84,7 +146,7 @@
 </template>
 
 <script setup>
-import { ref } from "vue";
+import { ref, computed } from "vue";
 
 const apiBase = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
 
@@ -100,8 +162,20 @@ const deletingId = ref(null);
 const message = ref("");
 const isError = ref(false);
 
-const showRestoreDialog = ref(false);
-const selectedBackup = ref(null);
+// Состояние для сортировки
+const sortField = ref("timestamp");
+const sortDirection = ref("desc");
+
+// Фильтры
+const filters = ref({
+  id: "",
+  type: "",
+  description: "",
+  base_backup: "",
+  timestamp: "",
+  size: "",
+  status: ""
+});
 
 const newBackup = ref({
   type: "full",
@@ -110,9 +184,119 @@ const newBackup = ref({
   async_mode: false,
 });
 
+// Обработанные бэкапы с учетом сортировки и фильтрации
+const processedBackups = computed(() => {
+  let result = [...backups.value];
+  
+  // Применяем фильтры
+  if (filters.value.id) {
+    result = result.filter(b => b.id.toLowerCase().includes(filters.value.id.toLowerCase()));
+  }
+  if (filters.value.type) {
+    result = result.filter(b => b.type === filters.value.type);
+  }
+  if (filters.value.description) {
+    result = result.filter(b => 
+      b.description && b.description.toLowerCase().includes(filters.value.description.toLowerCase())
+    );
+  }
+  if (filters.value.base_backup) {
+    result = result.filter(b => 
+      b.base_backup && b.base_backup.toLowerCase().includes(filters.value.base_backup.toLowerCase())
+    );
+  }
+  if (filters.value.timestamp) {
+    result = result.filter(b => 
+      formatDate(b.timestamp).toLowerCase().includes(filters.value.timestamp.toLowerCase())
+    );
+  }
+  if (filters.value.size) {
+    result = result.filter(b => {
+      if (!b.size) return false;
+      const bytes = b.size;
+      if (filters.value.size === 'small') return bytes < 1000000;
+      if (filters.value.size === 'medium') return bytes >= 1000000 && bytes < 100000000;
+      if (filters.value.size === 'large') return bytes >= 100000000;
+      return true;
+    });
+  }
+  if (filters.value.status) {
+    result = result.filter(b => b.status === filters.value.status);
+  }
+  
+  // Применяем сортировку
+  if (sortField.value) {
+    result.sort((a, b) => {
+      let valA = a[sortField.value];
+      let valB = b[sortField.value];
+      
+      // Особые случаи для сортировки
+      if (sortField.value === 'timestamp') {
+        valA = new Date(valA).getTime();
+        valB = new Date(valB).getTime();
+      }
+      if (sortField.value === 'size') {
+        valA = valA || 0;
+        valB = valB || 0;
+      }
+      if (sortField.value === 'base_backup') {
+        valA = valA || '';
+        valB = valB || '';
+      }
+      if (sortField.value === 'description') {
+        valA = valA || '';
+        valB = valB || '';
+      }
+      
+      // Сравнение значений
+      let comparison = 0;
+      if (valA < valB) comparison = -1;
+      if (valA > valB) comparison = 1;
+      
+      return sortDirection.value === 'asc' ? comparison : -comparison;
+    });
+  }
+  
+  return result;
+});
+
+function toggleSort(field) {
+  if (sortField.value === field) {
+    // Переключаем направление, если поле то же самое
+    sortDirection.value = sortDirection.value === 'asc' ? 'desc' : 'asc';
+  } else {
+    // Новое поле сортировки
+    sortField.value = field;
+    sortDirection.value = 'asc';
+  }
+}
+
+function resetFilters() {
+  filters.value = {
+    id: "",
+    type: "",
+    description: "",
+    base_backup: "",
+    timestamp: "",
+    size: "",
+    status: ""
+  };
+}
+
 function formatDate(dt) {
   return new Date(dt).toLocaleString();
 }
+
+function formatSize(bytes) {
+  if (bytes === null || bytes === undefined) return 'N/A';
+  if (bytes === 0) return '0 B';
+  
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${parseFloat((bytes / Math.pow(1024, i)).toFixed(2))} ${sizes[i]}`;
+}
+
+// Остальные методы остаются без изменений (fetchDatabases, fetchBackups, selectDatabase, createBackup, startRestore, deleteBackup)
 
 async function fetchDatabases() {
   loadingDatabases.value = true;
@@ -150,6 +334,7 @@ async function fetchBackups() {
 function selectDatabase(db) {
   selectedDatabase.value = db;
   backups.value = [];
+  resetFilters();
   fetchBackups();
   message.value = "";
   isError.value = false;
@@ -268,6 +453,11 @@ fetchDatabases();
 button {
   margin: 0.2rem;
 }
+.reset-btn {
+  background-color: #f0f0f0;
+  border: 1px solid #ccc;
+  margin-left: 10px;
+}
 .message {
   margin-top: 1rem;
   padding: 0.5rem;
@@ -276,5 +466,22 @@ button {
 .message.error {
   background-color: #fdd;
   color: #900;
+}
+.sortable {
+  cursor: pointer;
+  position: relative;
+  padding-right: 20px;
+}
+.sortable:hover {
+  background-color: #f5f5f5;
+}
+.sortable span {
+  position: absolute;
+  right: 5px;
+}
+.filter-row input, .filter-row select {
+  width: 90%;
+  padding: 5px;
+  box-sizing: border-box;
 }
 </style>

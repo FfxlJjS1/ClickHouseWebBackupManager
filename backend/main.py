@@ -47,10 +47,10 @@ class BackupInfo(BaseModel):
     id: str
     database: str
     type: str
-    destination: str
     base_backup: Optional[str]
     timestamp: str
     status: str
+    size: Optional[int] = None
     description: Optional[str] = None
 
 # --- Эндпоинты --- #
